@@ -1,0 +1,28 @@
+.env
+__pycache__/
+.DS_Store
+.venv/
+venv/
+
+# Python cache and tooling
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test and coverage output
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/

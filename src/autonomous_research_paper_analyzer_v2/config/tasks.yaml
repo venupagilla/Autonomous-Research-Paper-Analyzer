@@ -1,0 +1,154 @@
+fetch_papers_task:
+  description: >
+    Retrieve up to {max_papers} papers from arXiv for "{topic}" while minimizing payload size.
+    Keep only metadata required downstream: title, arxiv_id, published date, authors (max 3, then "et al."),
+    abstract_snippet (max 80 words), categories (max 3), and pdf_url.
+    Ranking rules:
+    - PRIORITIZE RECENCY: first select papers published from {recent_start_year} to {current_year}.
+    - If fewer than {max_papers} recent papers exist, backfill with older papers by relevance.
+    - Sort final list by publication date descending, then relevance score descending.
+    - Prefer stronger title+abstract relevance to {topic}.
+    - Remove duplicates or near-duplicates.
+    Then select a focused subset named focus_papers using top-{analysis_papers} ranking by:
+    - relevance to topic (primary)
+    - recency (secondary)
+    - methodological diversity (tertiary)
+    Output strictly as JSON. No markdown. No commentary.
+  expected_output: >
+    JSON object with shape:
+    {
+      "topic": "string",
+      "papers": [
+        {
+          "title": "string",
+          "arxiv_id": "string",
+          "published": "YYYY-MM-DD",
+          "authors": ["string"],
+          "abstract_snippet": "string <=80 words",
+          "categories": ["string"],
+          "pdf_url": "string",
+          "relevance_score": "integer 1-100"
+        }
+      ],
+      "focus_papers": [
+        {
+          "title": "string",
+          "arxiv_id": "string",
+          "published": "YYYY-MM-DD",
+          "authors": ["string"],
+          "abstract_snippet": "string <=80 words",
+          "categories": ["string"],
+          "pdf_url": "string",
+          "relevance_score": "integer 1-100"
+        }
+      ]
+    }
+  agent: paper_researcher
+
+analyze_papers_task:
+  description: >
+    Using only focus_papers from fetch_papers_task, perform extraction + methodology comparison + gap spotting.
+    Do not add external web research. Do not repeat abstract text.
+    Hard grounding rules:
+    - Use ONLY papers present in focus_papers from fetch_papers_task output.
+    - Never invent paper titles, arxiv_id values, authors, venues, or metrics.
+    - If fewer than 3 papers are available, explicitly state "limited evidence" in summaries.
+    For each paper provide:
+    - findings: max 3 bullets, each <= 18 words
+    - methodology: <= 22 words
+    - limitations: max 2 bullets, each <= 16 words
+    Then provide:
+    - methodology_clusters: max 4 clusters
+    - top_gaps: max 5 gaps ranked by impact (high/medium/low)
+    - evidence_quality: paper-level score 1-5
+    Output strictly as JSON. No markdown.
+  expected_output: >
+    JSON object with shape:
+    {
+      "paper_summaries": [
+        {
+          "arxiv_id": "string",
+          "findings": ["string"],
+          "methodology": "string",
+          "limitations": ["string"],
+          "evidence_quality": "integer 1-5"
+        }
+      ],
+      "methodology_clusters": [
+        {
+          "name": "string",
+          "paper_ids": ["string"],
+          "strength": "string <=18 words",
+          "weakness": "string <=18 words"
+        }
+      ],
+      "top_gaps": [
+        {
+          "gap": "string <=20 words",
+          "impact": "high|medium|low",
+          "why_it_matters": "string <=20 words"
+        }
+      ]
+    }
+  agent: paper_analyst
+
+synthesize_knowledge_task:
+  description: >
+    Merge innovation planning + future directions into one concise synthesis.
+    Input is analyze_papers_task output only.
+    Build compact knowledge structure:
+    - concept_nodes: max 12
+    - relation_edges: max 18
+    - innovation_opportunities: max 5, each maps one gap to one method/technology
+    - future_directions: max 5, each with feasibility and timeline
+    Keep each text field <= 20 words unless date/timeline. Output strictly as JSON.
+  expected_output: >
+    JSON object with shape:
+    {
+      "concept_nodes": [{"id": "string", "label": "string", "type": "paper|method|gap|opportunity"}],
+      "relation_edges": [{"source": "string", "target": "string", "relation": "supports|contradicts|extends|addresses"}],
+      "innovation_opportunities": [
+        {
+          "gap": "string",
+          "proposed_solution": "string <=20 words",
+          "novelty_score": "integer 1-10",
+          "feasibility": "high|medium|low",
+          "expected_impact": "string <=20 words"
+        }
+      ],
+      "future_directions": [
+        {
+          "direction": "string <=20 words",
+          "required_resources": "string <=20 words",
+          "timeline": "short-term|mid-term|long-term",
+          "feasibility": "high|medium|low"
+        }
+      ]
+    }
+  agent: knowledge_synthesizer
+
+generate_report_task:
+  description: >
+    Generate a concise markdown report from prior JSON outputs.
+    Hard grounding rules:
+    - Use ONLY evidence from fetch_papers_task and analyze_papers_task outputs.
+    - Do NOT introduce new papers, IDs, metrics, or claims not present upstream.
+    - If available papers are fewer than 3, include a "Data Sufficiency Note" explaining limited evidence.
+    - Include an "Evidence References" section listing only arxiv_id values from fetched papers.
+    Constraints:
+    - Target around {report_words} words total.
+    - Keep total length between 500 and 1200 words.
+    - No repeated points.
+    - Prefer tables and bullet summaries over long paragraphs.
+    Required sections:
+    1. Executive Summary
+    2. Evidence Snapshot (papers + methodology clusters)
+    3. Critical Gaps
+    4. Innovation Opportunities
+    5. Future Directions
+    6. Action Plan (next 30/60/90 days)
+    Include only claims supported by upstream data.
+  expected_output: >
+    A markdown report (650-900 words) with concise sections, at least one comparison table,
+    and a final prioritized action list.
+  agent: report_generator
