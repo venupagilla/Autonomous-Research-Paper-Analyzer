@@ -1,13 +1,15 @@
 import json
 import os
 import re
+from hashlib import sha1
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -30,6 +32,11 @@ class AsyncAnalyzeResponse(BaseModel):
 _executor = ThreadPoolExecutor(max_workers=2)
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = Lock()
+MAX_UPLOAD_FILES = 25
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_EXTRACTED_TEXT_CHARS = 22000
+MAX_SUMMARY_SOURCE_CHARS = 9000
+MAX_SUMMARY_WORDS = 120
 
 
 def _utc_now_iso() -> str:
@@ -117,7 +124,172 @@ def _prioritize_recent_papers(papers: list[Any], max_papers: int, current_year: 
 def _extract_report_arxiv_ids(report_markdown: str) -> set[str]:
     if not report_markdown:
         return set()
-    return set(re.findall(r"\b\d{4}\.\d{4,5}\b", report_markdown))
+    return set(re.findall(r"\b(?:\d{4}\.\d{4,5}|upl-[a-f0-9]{10})\b", report_markdown))
+
+
+def _safe_topic(topic: str | None) -> str:
+    value = (topic or "").strip()
+    if len(value) >= 3:
+        return value
+    return "Uploaded research papers"
+
+
+def _truncate_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words])
+
+
+def _fallback_summary(extracted_text: str) -> str:
+    words = extracted_text.split()
+    summary_words = words[:80]
+    return " ".join(summary_words).strip() or "No summary could be extracted."
+
+
+def _is_llm_pdf_summary_enabled() -> bool:
+    value = os.getenv("ENABLE_LLM_PDF_SUMMARY", "1").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _summarize_with_llm_single_pass(extracted_text: str, topic: str) -> str:
+    """Generate a grounded single-pass summary for one paper using an LLM call."""
+    try:
+        from litellm import completion
+    except ImportError as exc:
+        raise RuntimeError("litellm is unavailable for LLM summarization.") from exc
+
+    model = os.getenv("PDF_SUMMARY_MODEL", "").strip() or os.getenv("SMALL_LLM_MODEL", "gpt-4o-mini")
+    source_text = extracted_text[:MAX_SUMMARY_SOURCE_CHARS]
+
+    response = completion(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You summarize research papers from extracted PDF text. "
+                    "Do not invent claims. Use only provided content."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Summarize this research paper in 90-120 words. "
+                    "Include objective, method, key findings, and one limitation. "
+                    "Use plain text only and no bullets. "
+                    f"Topic context: {topic}\n\n"
+                    "Paper text:\n"
+                    f"{source_text}"
+                ),
+            },
+        ],
+        temperature=0.2,
+        max_tokens=220,
+        timeout=30,
+    )
+
+    summary = ""
+    choices = (response or {}).get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    if choices:
+        first_choice = choices[0]
+        if isinstance(first_choice, dict):
+            message = first_choice.get("message", {})
+            summary = str(message.get("content", "")).strip()
+        else:
+            message = getattr(first_choice, "message", None)
+            summary = str(getattr(message, "content", "")).strip()
+
+    if not summary:
+        raise RuntimeError("LLM returned an empty summary.")
+
+    return _truncate_words(summary, MAX_SUMMARY_WORDS)
+
+
+def _extract_pdf_text(file_bytes: bytes) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError("Missing PDF dependency. Install pypdf to enable uploaded-PDF analysis.") from exc
+
+    reader = PdfReader(BytesIO(file_bytes))
+    chunks: list[str] = []
+    for page in reader.pages:
+        text = (page.extract_text() or "").strip()
+        if text:
+            chunks.append(text)
+
+    extracted = "\n".join(chunks).strip()
+    if not extracted:
+        raise ValueError("No extractable text found in PDF")
+    return extracted[:MAX_EXTRACTED_TEXT_CHARS]
+
+
+def _normalize_uploaded_text_to_paper(
+    filename: str,
+    extracted_text: str,
+    index: int,
+    topic: str,
+) -> dict[str, Any]:
+    if _is_llm_pdf_summary_enabled():
+        try:
+            snippet = _summarize_with_llm_single_pass(extracted_text, topic)
+        except Exception:
+            snippet = _fallback_summary(extracted_text)
+    else:
+        snippet = _fallback_summary(extracted_text)
+
+    line_candidates = [line.strip() for line in extracted_text.splitlines() if line.strip()]
+    title = line_candidates[0][:180] if line_candidates else os.path.splitext(filename)[0]
+    if len(title) < 5:
+        title = os.path.splitext(filename)[0] or f"Uploaded Paper {index + 1}"
+
+    digest = sha1((filename + extracted_text[:400]).encode("utf-8", errors="ignore")).hexdigest()[:10]
+    synthetic_id = f"upl-{digest}"
+
+    return {
+        "title": title,
+        "arxiv_id": synthetic_id,
+        "published": datetime.now().strftime("%Y-%m-%d"),
+        "authors": ["uploaded-document"],
+        "abstract_snippet": snippet,
+        "categories": ["uploaded-pdf"],
+        "pdf_url": "",
+        "relevance_score": 85,
+        "source": "uploaded-pdf",
+        "source_filename": filename,
+    }
+
+
+async def _normalize_uploaded_papers(files: list[UploadFile], topic: str) -> list[dict[str, Any]]:
+    if not files:
+        raise HTTPException(status_code=422, detail="At least one PDF file is required.")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=422, detail=f"A maximum of {MAX_UPLOAD_FILES} files is supported.")
+
+    normalized: list[dict[str, Any]] = []
+
+    for index, upload in enumerate(files):
+        filename = upload.filename or f"uploaded_{index + 1}.pdf"
+        content_type = (upload.content_type or "").lower()
+        if not filename.lower().endswith(".pdf") and content_type != "application/pdf":
+            raise HTTPException(status_code=422, detail=f"{filename}: only PDF files are supported.")
+
+        file_bytes = await upload.read()
+        await upload.close()
+        if not file_bytes:
+            raise HTTPException(status_code=422, detail=f"{filename}: file is empty.")
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            max_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+            raise HTTPException(status_code=422, detail=f"{filename}: file exceeds {max_mb}MB limit.")
+
+        try:
+            extracted_text = _extract_pdf_text(file_bytes)
+            normalized.append(_normalize_uploaded_text_to_paper(filename, extracted_text, index, topic))
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"{filename}: failed to parse PDF ({exc}).") from exc
+
+    return normalized
 
 
 def _is_groq_role_error(exc: Exception) -> bool:
@@ -130,6 +302,7 @@ def _run_analysis_with_fallback(
     max_papers: int,
     analysis_papers: int,
     report_words: int,
+    uploaded_papers: list[dict[str, Any]] | None = None,
 ) -> Any:
     """Run analysis and retry once with safer model routing for known Groq role errors."""
     try:
@@ -138,6 +311,7 @@ def _run_analysis_with_fallback(
             max_papers=max_papers,
             analysis_papers=analysis_papers,
             report_words=report_words,
+            uploaded_papers=uploaded_papers,
         )
     except Exception as exc:
         if not _is_groq_role_error(exc):
@@ -155,6 +329,7 @@ def _run_analysis_with_fallback(
                 max_papers=max_papers,
                 analysis_papers=analysis_papers,
                 report_words=report_words,
+                uploaded_papers=uploaded_papers,
             )
         finally:
             if original_small_model is None:
@@ -300,6 +475,82 @@ def _run_async_job(job_id: str, payload: AnalyzeRequest) -> None:
         done_job["updated_at"] = _utc_now_iso()
 
 
+def _run_async_uploaded_job(
+    job_id: str,
+    topic: str,
+    max_papers: int,
+    analysis_papers: int,
+    report_words: int,
+    uploaded_papers: list[dict[str, Any]],
+) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        if job.get("cancel_requested"):
+            job["status"] = "canceled"
+            job["progress"] = 100
+            job["message"] = "Canceled before execution."
+            job["updated_at"] = _utc_now_iso()
+            return
+        job["status"] = "running"
+        job["progress"] = 35
+        job["message"] = "Uploaded papers normalized. Running analysis workflow."
+        job["updated_at"] = _utc_now_iso()
+
+    try:
+        bounded_analysis = min(analysis_papers, max_papers)
+        crew_output = _run_analysis_with_fallback(
+            topic=topic,
+            max_papers=max_papers,
+            analysis_papers=bounded_analysis,
+            report_words=report_words,
+            uploaded_papers=uploaded_papers,
+        )
+
+        with _jobs_lock:
+            finalizing_job = _jobs.get(job_id)
+            if finalizing_job and not finalizing_job.get("cancel_requested"):
+                finalizing_job["status"] = "finalizing"
+                finalizing_job["progress"] = 90
+                finalizing_job["message"] = "Finalizing report output."
+                finalizing_job["updated_at"] = _utc_now_iso()
+
+        result = _build_analysis_payload(
+            crew_output,
+            topic,
+            max_papers,
+            bounded_analysis,
+            report_words,
+        )
+    except Exception as exc:
+        with _jobs_lock:
+            failed_job = _jobs.get(job_id)
+            if not failed_job:
+                return
+            failed_job["status"] = "failed"
+            failed_job["progress"] = 100
+            failed_job["message"] = str(exc)
+            failed_job["updated_at"] = _utc_now_iso()
+        return
+
+    with _jobs_lock:
+        done_job = _jobs.get(job_id)
+        if not done_job:
+            return
+        if done_job.get("cancel_requested"):
+            done_job["status"] = "canceled"
+            done_job["progress"] = 100
+            done_job["message"] = "Cancellation requested. Background task may have already finished."
+            done_job["updated_at"] = _utc_now_iso()
+            return
+        done_job["status"] = "completed"
+        done_job["progress"] = 100
+        done_job["message"] = "Analysis completed."
+        done_job["result"] = result
+        done_job["updated_at"] = _utc_now_iso()
+
+
 app = FastAPI(title="Autonomous Research Paper Analyzer API", version="1.0.0")
 
 app.add_middleware(
@@ -341,6 +592,45 @@ def analyze(payload: AnalyzeRequest) -> dict[str, Any]:
     )
 
 
+@app.post("/api/analyze/upload")
+async def analyze_uploaded(
+    files: list[UploadFile] = File(...),
+    topic: str | None = Form(default=None),
+    max_papers: int = Form(default=30),
+    analysis_papers: int = Form(default=20),
+    report_words: int = Form(default=800),
+) -> dict[str, Any]:
+    if max_papers < 1 or max_papers > 200:
+        raise HTTPException(status_code=422, detail="max_papers must be between 1 and 200.")
+    if analysis_papers < 3 or analysis_papers > 60:
+        raise HTTPException(status_code=422, detail="analysis_papers must be between 3 and 60.")
+    if report_words < 500 or report_words > 1200:
+        raise HTTPException(status_code=422, detail="report_words must be between 500 and 1200.")
+
+    safe_topic = _safe_topic(topic)
+    normalized_papers = await _normalize_uploaded_papers(files, safe_topic)
+
+    try:
+        bounded_analysis = min(analysis_papers, max_papers)
+        crew_output = _run_analysis_with_fallback(
+            topic=safe_topic,
+            max_papers=max_papers,
+            analysis_papers=bounded_analysis,
+            report_words=report_words,
+            uploaded_papers=normalized_papers,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return _build_analysis_payload(
+        crew_output,
+        safe_topic,
+        max_papers,
+        bounded_analysis,
+        report_words,
+    )
+
+
 @app.post("/api/analyze/async", response_model=AsyncAnalyzeResponse)
 def analyze_async(payload: AnalyzeRequest) -> AsyncAnalyzeResponse:
     job_id = str(uuid4())
@@ -359,6 +649,58 @@ def analyze_async(payload: AnalyzeRequest) -> AsyncAnalyzeResponse:
         }
 
     _executor.submit(_run_async_job, job_id, payload)
+    return AsyncAnalyzeResponse(job_id=job_id, status="queued", poll_url=f"/api/jobs/{job_id}")
+
+
+@app.post("/api/analyze/upload/async", response_model=AsyncAnalyzeResponse)
+async def analyze_uploaded_async(
+    files: list[UploadFile] = File(...),
+    topic: str | None = Form(default=None),
+    max_papers: int = Form(default=30),
+    analysis_papers: int = Form(default=20),
+    report_words: int = Form(default=800),
+) -> AsyncAnalyzeResponse:
+    if max_papers < 1 or max_papers > 200:
+        raise HTTPException(status_code=422, detail="max_papers must be between 1 and 200.")
+    if analysis_papers < 3 or analysis_papers > 60:
+        raise HTTPException(status_code=422, detail="analysis_papers must be between 3 and 60.")
+    if report_words < 500 or report_words > 1200:
+        raise HTTPException(status_code=422, detail="report_words must be between 500 and 1200.")
+
+    job_id = str(uuid4())
+    now = _utc_now_iso()
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 5,
+            "message": "Queued. Extracting and normalizing uploaded PDFs.",
+            "created_at": now,
+            "updated_at": now,
+            "cancel_requested": False,
+            "result": None,
+        }
+
+    safe_topic = _safe_topic(topic)
+    normalized_papers = await _normalize_uploaded_papers(files, safe_topic)
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job and not job.get("cancel_requested"):
+            job["status"] = "running"
+            job["progress"] = 25
+            job["message"] = "Uploaded PDFs parsed successfully. Queueing analysis."
+            job["updated_at"] = _utc_now_iso()
+
+    _executor.submit(
+        _run_async_uploaded_job,
+        job_id,
+        safe_topic,
+        max_papers,
+        analysis_papers,
+        report_words,
+        normalized_papers,
+    )
     return AsyncAnalyzeResponse(job_id=job_id, status="queued", poll_url=f"/api/jobs/{job_id}")
 
 

@@ -50,10 +50,12 @@ class AutonomousResearchPaperAnalyzerV2():
     # https://docs.crewai.com/concepts/agents#agent-tools
     @agent
     def paper_researcher(self) -> Agent:
+        disable_fetch_tools = os.getenv("DISABLE_FETCH_TOOLS", "0") == "1"
+        tools = [] if disable_fetch_tools else [ArxivPaperTool(), TavilySearchTool()]
         return Agent(
             config=self.agents_config['paper_researcher'], # type: ignore[index]
             # Tavily is the only web-search provider used in this project.
-            tools=[ArxivPaperTool(), TavilySearchTool()],
+            tools=tools,
             llm=self._small_llm(temperature=0.0),
             verbose=False,
         )

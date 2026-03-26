@@ -1,6 +1,9 @@
 fetch_papers_task:
   description: >
-    Retrieve up to {max_papers} papers from arXiv for "{topic}" while minimizing payload size.
+    If has_uploaded_papers is "true", do NOT use external tools and do NOT fetch from arXiv.
+    In that case, parse uploaded_papers_json and return it as both papers and focus_papers
+    (truncate to max_papers and analysis_papers respectively, preserving order).
+    If has_uploaded_papers is "false", retrieve up to {max_papers} papers from arXiv for "{topic}" while minimizing payload size.
     Keep only metadata required downstream: title, arxiv_id, published date, authors (max 3, then "et al."),
     abstract_snippet (max 80 words), categories (max 3), and pdf_url.
     Ranking rules:
@@ -134,7 +137,7 @@ generate_report_task:
     - Use ONLY evidence from fetch_papers_task and analyze_papers_task outputs.
     - Do NOT introduce new papers, IDs, metrics, or claims not present upstream.
     - If available papers are fewer than 3, include a "Data Sufficiency Note" explaining limited evidence.
-    - Include an "Evidence References" section listing only arxiv_id values from fetched papers.
+    - Include an "Evidence References" section listing only paper IDs from fetched papers (arxiv_id).
     Constraints:
     - Target around {report_words} words total.
     - Keep total length between 500 and 1200 words.

@@ -34,12 +34,13 @@
 
 .search-row {
   display: grid;
-  grid-template-columns: 1fr 130px auto;
+  grid-template-columns: 170px 1fr minmax(220px, 1fr) 130px auto;
   gap: 0.75rem;
   margin-bottom: 1.5rem;
 }
 
-.search-row input {
+.search-row input,
+.search-row select {
   width: 100%;
   border: 1px solid #d8cdbb;
   border-radius: 14px;
@@ -69,6 +70,17 @@
   font-size: 1rem;
   font-family: var(--body-font);
   background: rgba(255, 255, 255, 0.9);
+}
+
+.upload-input {
+  padding: 0.65rem 0.8rem;
+  font-size: 0.9rem;
+}
+
+.upload-hint {
+  margin: -0.9rem 0 0.9rem;
+  color: #6f5644;
+  font-size: 0.88rem;
 }
 
 .search-row button {

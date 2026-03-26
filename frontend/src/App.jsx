@@ -40,6 +40,8 @@ function App() {
 
   const [query, setQuery] = useState('autonomous research agents')
   const [maxPapers, setMaxPapers] = useState(5)
+  const [analysisMode, setAnalysisMode] = useState('arxiv-title')
+  const [uploadedFiles, setUploadedFiles] = useState([])
   const [activeFilter, setActiveFilter] = useState('all')
   const [papers, setPapers] = useState(samplePapers)
   const [reportMarkdown, setReportMarkdown] = useState('')
@@ -118,8 +120,31 @@ function App() {
   }, [activeFilter, papers])
 
   const shouldUseAsyncMode = () => {
+    if (analysisMode === 'uploaded-pdfs') {
+      return uploadedFiles.length >= 3 || maxPapers >= 8
+    }
+
     const wordCount = query.trim().split(/\s+/).filter(Boolean).length
     return maxPapers >= 8 || wordCount >= 6
+  }
+
+  const buildJsonPayload = () => ({
+    topic: query,
+    max_papers: maxPapers,
+  })
+
+  const buildUploadFormPayload = () => {
+    const formData = new FormData()
+    uploadedFiles.forEach((file) => {
+      formData.append('files', file)
+    })
+
+    if (query.trim()) {
+      formData.append('topic', query.trim())
+    }
+
+    formData.append('max_papers', String(maxPapers))
+    return formData
   }
 
   const clearNetworkControls = () => {
@@ -339,17 +364,28 @@ function App() {
     setJobProgress(35)
     setJobStage('running')
 
-    const response = await fetch(`${apiBaseUrl}/api/analyze`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        topic: query,
-        max_papers: maxPapers,
-      }),
-      signal,
-    })
+    const endpoint =
+      analysisMode === 'uploaded-pdfs'
+        ? `${apiBaseUrl}/api/analyze/upload`
+        : `${apiBaseUrl}/api/analyze`
+
+    const requestInit =
+      analysisMode === 'uploaded-pdfs'
+        ? {
+            method: 'POST',
+            body: buildUploadFormPayload(),
+            signal,
+          }
+        : {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(buildJsonPayload()),
+            signal,
+          }
+
+    const response = await fetch(endpoint, requestInit)
 
     if (!response.ok) {
       const data = await response.json().catch(() => ({}))
@@ -362,17 +398,28 @@ function App() {
   const startAsyncAnalysis = async (signal) => {
     setJobStatus('Async mode: queueing job...')
 
-    const kickoffResponse = await fetch(`${apiBaseUrl}/api/analyze/async`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        topic: query,
-        max_papers: maxPapers,
-      }),
-      signal,
-    })
+    const endpoint =
+      analysisMode === 'uploaded-pdfs'
+        ? `${apiBaseUrl}/api/analyze/upload/async`
+        : `${apiBaseUrl}/api/analyze/async`
+
+    const requestInit =
+      analysisMode === 'uploaded-pdfs'
+        ? {
+            method: 'POST',
+            body: buildUploadFormPayload(),
+            signal,
+          }
+        : {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(buildJsonPayload()),
+            signal,
+          }
+
+    const kickoffResponse = await fetch(endpoint, requestInit)
 
     if (!kickoffResponse.ok) {
       const data = await kickoffResponse.json().catch(() => ({}))
@@ -443,6 +490,19 @@ function App() {
     setJobProgress(0)
     setJobStage('queued')
 
+    const trimmedQuery = query.trim()
+    if (analysisMode === 'arxiv-title' && trimmedQuery.length < 3) {
+      setError('Please enter at least 3 characters for topic/title mode.')
+      setIsLoading(false)
+      return
+    }
+
+    if (analysisMode === 'uploaded-pdfs' && uploadedFiles.length === 0) {
+      setError('Please upload at least one PDF file in uploaded mode.')
+      setIsLoading(false)
+      return
+    }
+
     const controller = new AbortController()
     abortControllerRef.current = controller
 
@@ -501,7 +561,7 @@ function App() {
     <div className="page-shell">
       <header className="hero-panel">
         <p className="eyebrow">Autonomous Research Paper Analyzer</p>
-        <h1>Find, rank, and summarize papers in one focused workspace.</h1>
+        <h1>Extract insights with intelligent research analysis.</h1>
         <p className="hero-copy">
           A React frontend for running your analysis pipeline, tracking key
           findings, and preparing evidence-backed research briefs.
@@ -514,13 +574,40 @@ function App() {
             runAnalysis()
           }}
         >
+          <select
+            value={analysisMode}
+            onChange={(event) => setAnalysisMode(event.target.value)}
+            aria-label="Analysis mode"
+            disabled={isLoading}
+          >
+            <option value="arxiv-title">arXiv Title Mode</option>
+            <option value="uploaded-pdfs">Uploaded PDFs Mode</option>
+          </select>
           <input
             type="text"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search topic, method, or venue"
+            placeholder={
+              analysisMode === 'uploaded-pdfs'
+                ? 'Optional topic hint (e.g., kidney tumor segmentation)'
+                : 'Search topic, method, or venue'
+            }
             aria-label="Research query"
           />
+          {analysisMode === 'uploaded-pdfs' ? (
+            <input
+              type="file"
+              accept="application/pdf,.pdf"
+              multiple
+              onChange={(event) => {
+                const files = Array.from(event.target.files || [])
+                setUploadedFiles(files)
+              }}
+              disabled={isLoading}
+              aria-label="Upload PDF files"
+              className="upload-input"
+            />
+          ) : null}
           <input
             type="number"
             min="1"
@@ -535,6 +622,13 @@ function App() {
           </button>
         </form>
 
+        {analysisMode === 'uploaded-pdfs' ? (
+          <p className="upload-hint">
+            Upload 1 to 10 PDF files. Topic is optional in this mode.
+            {uploadedFiles.length > 0 ? ` Selected: ${uploadedFiles.length}` : ''}
+          </p>
+        ) : null}
+
         {isLoading ? (
           <button type="button" className="cancel-btn" onClick={cancelAnalysis}>
             Cancel
@@ -543,7 +637,11 @@ function App() {
 
         {error ? <p className="status-message error">{error}</p> : null}
         {!error && isLoading ? (
-          <p className="status-message">Fetching papers and generating report...</p>
+          <p className="status-message">
+            {analysisMode === 'uploaded-pdfs'
+              ? 'Parsing uploaded PDFs and generating report...'
+              : 'Fetching papers and generating report...'}
+          </p>
         ) : null}
         {!error && jobStatus ? <p className="status-message">{jobStatus}</p> : null}
 
